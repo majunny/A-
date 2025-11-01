@@ -1,30 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-흰색=도로(자유공간), 검은색=벽 이미지를 위한 길찾기
-1) 스켈레톤 그래프에서 경로 시도 (가중 비용 반영)
-2) 실패 시 픽셀 격자 A* 폴백 (가중 비용 반영)
-
-추가 UX:
-- 'R' 키: [경로 설정] / [체증 설정] 모드 전환 (한 창)
-- 'C' 키: 모든 체증 영역 제거
-- 체증 모드에서 좌클릭 2번으로 사각형 체증 영역 추가
-- Enter: 경로 탐색
-- 경로 실패 시 메시지
-
-교통/환경 모델:
-- 체증 비용 배수(CONJESTION_W) + 팽창(DILATE_RADIUS)
-- 진입/내부/경계 통과 패널티(ENTRY/INSIDE/CROSS)
-- 벽타기 억제:
-  (a) 도로 마스크 침식(ERODE_ITERS)
-  (b) 벽 근접 패널티(거리변환 기반 wall_penalty)
-  (c) A* 코너-컷팅 금지(대각 이동 시 양옆 직교칸 열려야 허용)
+중앙선(흰색) 우선 사용, 없으면 '도로 스켈레톤'을 중앙선으로 자동 대체
++ 체증 가중치 반영
++ 결과창 2개 (dual / allwhite)
++ 직선(도로 뚫는 라인) 없음: 항상 중앙선(또는 스켈레톤) 위로만 탐색
 
 필요:
-    pip install opencv-contrib-python networkx numpy
+    pip install opencv-contrib-python numpy
 """
 
-import cv2, numpy as np, networkx as nx
-from math import hypot
+import cv2, numpy as np
 from heapq import heappush, heappop
 
 # =========================
@@ -33,54 +18,43 @@ from heapq import heappush, heappop
 img_path = "main.png"
 
 # -------------------------
-# 튜닝 파라미터
+# 밝기/마스크 파라미터
 # -------------------------
-# 체증
-CONGESTION_W   = 12.0   # 체증 구역 이동 가중치 배수 (10~30)
-DILATE_RADIUS  = 11     # 체증 마스크 팽창 반경 (픽셀, 7~15)
-ENTRY_PENALTY  = 120.0  # 비체증→체증 진입 고정비
-INSIDE_PENALTY = 8.0    # 체증 내부 이동 시 스텝당 고정비
-CROSS_PENALTY  = 40.0   # 체증 경계 통과 고정비
+T_GRAY = 128              # 회색 도로: gray >= T_GRAY
+STRICT_WHITE = 245        # 중앙선(엄격): RGB 모두 >= 245
+CENTERLINE_DILATE = 1     # 중앙선 단절 보정 (0~1 권장)
 
-# 벽타기 억제
-ERODE_ITERS          = 0     # 도로 침식 횟수(벽에서 여유 간격 확보), 0~3
-WALL_PENALTY_GAIN    = 0   # 벽 가까울수록 추가될 가중치 계수
-WALL_PENALTY_DECAY   = 0   # 거리감쇠 (픽셀). 작을수록 경계 근처만 강함.
+# 스켈레톤 생성 시 도로 전처리(침식/열림) 정도
+ROAD_ERODE_ITERS = 0
+ROAD_OPEN_ITERS = 1
 
-# 그래픽
-DRAW_SKELETON_GRAY   = (200, 200, 200)
-DRAW_ROUTE_RED       = (0, 0, 255)
-DRAW_START_BLUE      = (255, 0, 0)
-DRAW_GOAL_GREEN      = (0, 255, 0)
+# A* 인접(대각은 끊길 때만 True로)
+ALLOW_DIAGONAL = False
 
-NEI8 = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+# -------------------------
+# 체증 비용 파라미터
+# -------------------------
+CONGESTION_W = 12.0  # 체증 내부 배수
+ENTRY_PENALTY = 30.0  # 비체증→체증 진입 고정비
+INSIDE_PENALTY = 2.5   # 체증 내부 스텝당 고정비
+DILATE_CONGEST = 1     # 체증 사각형 팽창(0~2)
 
-# ------------------------------------------------
-# 0) 도로(자유공간) 마스크: 흰색=1, 검은=0
-# ------------------------------------------------
-def road_mask_white(img_bgr):
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    # Otsu로 흰/검 분리
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    road = (th == 255).astype(np.uint8)  # 흰색=1
-    # 잡음 정리 및 작은 틈 메우기
-    road = cv2.morphologyEx(road * 255, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), 1)
-    road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 1)
-    road = (road > 0).astype(np.uint8)
-    return road  # 0/1
+NEI4 = [(0, -1), (0, 1), (-1, 0), (1, 0)]
+NEI8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
 
-# ------------------------------------------------
-# 1) 스켈레톤
-# ------------------------------------------------
+# =========================
+# 유틸: 스켈레톤(1px) 만들기
+# =========================
 def skeletonize01(bin01):
+    """입력: 0/1, 출력: 0/1 스켈레톤(가능하면 ximgproc thinning)"""
     try:
         import cv2.ximgproc as xi
         sk = xi.thinning((bin01 * 255).astype(np.uint8), xi.THINNING_ZHANGSUEN)
         return (sk > 0).astype(np.uint8)
     except Exception:
-        # 간단 fallback
-        prev = np.zeros_like(bin01)
-        skel = bin01.copy()
+        # 간단 대체 스켈레톤
+        prev = np.zeros_like(bin01, np.uint8)
+        skel = bin01.copy().astype(np.uint8)
         kernel = np.ones((3, 3), np.uint8)
         while True:
             eroded = cv2.erode(skel, kernel, 1)
@@ -92,269 +66,173 @@ def skeletonize01(bin01):
                 break
         return (prev > 0).astype(np.uint8)
 
-def degree_map(skel01):
-    K = np.array([[1,1,1],[1,0,1],[1,1,1]], np.uint8)
-    return cv2.filter2D(skel01.astype(np.uint8), -1, K)
-
-def extract_nodes_and_map(skel01):
-    deg = degree_map(skel01)
-    node_mask = (skel01 > 0) & (deg != 2)
-    num, lab = cv2.connectedComponents(node_mask.astype(np.uint8), 8)
-    nodes, node_idmap = [], np.full(skel01.shape, -1, np.int32)
-    nid = 0
-    for comp in range(1, num):
-        ys, xs = np.where(lab == comp)
-        cy, cx = int(np.mean(ys)), int(np.mean(xs))
-        nodes.append((cy, cx))
-        node_idmap[lab == comp] = nid
-        nid += 1
-    return nodes, node_idmap
-
-def trace_edges(skel01, nodes, node_idmap,
-                cost_map=None, entry_penalty=0.0, cong_mask=None,
-                inside_penalty=0.0, cross_penalty=0.0):
+# =========================
+# 마스크 생성 (도로/중앙선)
+# =========================
+def medial_axis_center(road01):
     """
-    스켈레톤 엣지(노드-노드) 추출 + 가중 길이(체증 비용/패널티) 계산
+    도로(0/1)에서 거리변환 능선(지역최대)을 검출해 1px 중앙선 생성.
+    얇고 연속적인 '진짜 중심선'만 남기므로 원형/도넛에서 지름선(Chord)이 사라짐.
     """
-    h, w = skel01.shape
-    visited = np.zeros_like(skel01, np.uint8)
-    edges = []
+    road_u8 = (road01.astype(np.uint8) * 255)
+    # 바깥(벽)을 0, 도로를 255로 두고 거리변환
+    dist = cv2.distanceTransform((road_u8 > 0).astype(np.uint8), cv2.DIST_L2, 3)
+    # 능선: 팽창 후 자신과 같은 픽셀만 남김(지역최대)
+    dist_f = cv2.normalize(dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    maxmap = cv2.dilate(dist_f, kernel, 1)
+    ridge = (dist_f == maxmap) & (road01 > 0)
 
-    def seg_cost(p1, p2):
-        (y1, x1), (y2, x2) = p1, p2
-        base = hypot(y2 - y1, x2 - x1)
-        # 평균 가중치
-        c = 1.0 if cost_map is None else 0.5 * (cost_map[y1, x1] + cost_map[y2, x2])
-        add = 0.0
-        if cong_mask is not None:
-            a = cong_mask[y1, x1] > 0
-            b = cong_mask[y2, x2] > 0
-            if (not a) and b:
-                add += entry_penalty + cross_penalty
-            if a and b:
-                add += inside_penalty
-        return base * float(c) + add
+    # 한 픽셀 얇게 정리
+    ridge = ridge.astype(np.uint8)
+    try:
+        import cv2.ximgproc as xi
+        ridge = xi.thinning(ridge * 255, xi.THINNING_ZHANGSUEN)
+        ridge = (ridge > 0).astype(np.uint8)
+    except Exception:
+        ridge = skeletonize01(ridge)  # 대체
+    return ridge
 
-    def poly_weighted_length(poly):
-        if len(poly) < 2:
-            return 0.0
-        total = 0.0
-        for a, b in zip(poly[:-1], poly[1:]):
-            total += seg_cost(a, b)
-        return total
 
-    def walk(u_id, sy, sx):
-        y, x = sy, sx
-        py, px = -1, -1
-        poly = []
-        while True:
-            if visited[y, x]:
-                break
-            visited[y, x] = 1
-            poly.append((y, x))
-            v_id = node_idmap[y, x]
-            if v_id != -1 and v_id != u_id:
-                full = [(nodes[u_id][0], nodes[u_id][1])] + poly + [(nodes[v_id][0], nodes[v_id][1])]
-                l = poly_weighted_length(full)
-                a, b = sorted([u_id, v_id])
-                return (a, b, l, full)
-            nbr = []
-            for dy, dx in NEI8:
-                ny, nx = y + dy, x + dx
-                if 0 <= ny < h and 0 <= nx < w and skel01[ny, nx] and (ny, nx) != (py, px):
-                    nbr.append((ny, nx))
-            if len(nbr) != 1:
-                return None
-            py, px = y, x
-            y, x = nbr[0]
-
-    for u_id, (uy, ux) in enumerate(nodes):
-        ys, xs = np.where(node_idmap == u_id)
-        starts = set()
-        for y, x in zip(ys, xs):
-            for dy, dx in NEI8:
-                ny, nx = y + dy, x + dx
-                if 0 <= ny < h and 0 <= nx < w and skel01[ny, nx] and node_idmap[ny, nx] == -1:
-                    starts.add((ny, nx))
-        for sy, sx in starts:
-            res = walk(u_id, sy, sx)
-            if res:
-                edges.append(res)
-
-    uniq = {}
-    for a, b, l, poly in edges:
-        if (a, b) not in uniq or l < uniq[(a, b)][0]:
-            uniq[(a, b)] = (l, poly)
-    return [(a, b, l, poly) for (a, b), (l, poly) in uniq.items()]
-
-def build_graph(nodes, edges):
-    G = nx.Graph()
-    for i, (y, x) in enumerate(nodes):
-        G.add_node(i, pos=(x, y))
-    for a, b, l, poly in edges:
-        G.add_edge(a, b, weight=l, poly=poly)
-    return G
-
-def nearest_skel_pixel(pt_xy, skel01):
-    x0, y0 = pt_xy
-    ys, xs = np.where(skel01 > 0)
-    if len(xs) == 0:
-        return None
-    i = int(np.argmin((xs - x0) ** 2 + (ys - y0) ** 2))
-    return (int(xs[i]), int(ys[i]))  # (x,y)
-
-def bfs_to_node(px_xy, skel01, node_idmap):
-    from collections import deque
-    x0, y0 = px_xy
-    h, w = skel01.shape
-    if not (0 <= x0 < w and 0 <= y0 < h) or skel01[y0, x0] == 0:
-        return None
-    if node_idmap[y0, x0] != -1:
-        return int(node_idmap[y0, x0])
-    seen = np.zeros_like(skel01, np.uint8)
-    q = deque([(y0, x0)])
-    seen[y0, x0] = 1
-    while q:
-        y, x = q.popleft()
-        for dy, dx in NEI8:
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < h and 0 <= nx < w and not seen[ny, nx] and skel01[ny, nx]:
-                if node_idmap[ny, nx] != -1:
-                    return int(node_idmap[ny, nx])
-                seen[ny, nx] = 1
-                q.append((ny, nx))
-    return None
-
-def stitch_polylines(path, G):
-    coords = []
-    for u, v in zip(path[:-1], path[1:]):
-        poly = G.edges[u, v]['poly']
-        if coords and coords[-1] == poly[0]:
-            coords.extend(poly[1:])
-        else:
-            coords.extend(poly)
-    return coords
-
-# ------------------------------------------------
-# 2) 격자 A* (가중 비용 + 코너-컷팅 금지)
-# ------------------------------------------------
-def astar_grid(road01, start_xy, goal_xy,
-               cost_map=None, entry_penalty=0.0, cong_mask=None,
-               inside_penalty=0.0, cross_penalty=0.0):
+def make_road_and_center(img_bgr):
     """
-    road01: 0/1 (흰색=1: 이동 가능)
+    1) road_gray: 밝은 영역(회색 도로)
+    2) center_white: '엄격 흰색' 중앙선 (있으면 사용)
+    3) fallback_center: road_gray에서 스켈레톤(도로 중심선 대용)
+    최종 center = (center_white가 충분히 크면 그걸) else (fallback_center)
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    road_gray = (gray >= T_GRAY).astype(np.uint8)
+
+    # 도로 전처리(너무 얇은 곳 넓히고 구멍 조금 메움)
+    if ROAD_OPEN_ITERS > 0:
+        kern = np.ones((3, 3), np.uint8)
+        road_gray = cv2.morphologyEx(road_gray, cv2.MORPH_OPEN, kern, iterations=ROAD_OPEN_ITERS)
+    if ROAD_ERODE_ITERS > 0:
+        road_gray = cv2.erode(road_gray, np.ones((3, 3), np.uint8), iterations=ROAD_ERODE_ITERS)
+
+    # 중앙선(엄격 흰색)
+    b, g, r = cv2.split(img_bgr)
+    center_white = ((b >= STRICT_WHITE) & (g >= STRICT_WHITE) & (r >= STRICT_WHITE)).astype(np.uint8)
+    center_white &= road_gray  # 도로 내부만
+
+    if CENTERLINE_DILATE > 0:
+        k = 2 * CENTERLINE_DILATE + 1
+        center_white = cv2.dilate(center_white, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), 1)
+
+    # 스켈레톤(도로 중심선 대용)
+    fallback_center = medial_axis_center(road_gray)
+
+    # 선택 기준: 흰 중앙선 픽셀이 충분하면 그대로 사용, 아니면 스켈레톤 사용
+    n_white = int(center_white.sum())
+    n_fallback = int(fallback_center.sum())
+    use_white = (n_white > 0)
+
+    center = center_white if use_white else fallback_center
+    return road_gray, center, center_white, fallback_center, use_white
+
+# =========================
+# 중앙선 전용 A* (체증 비용 반영)
+# =========================
+def astar_on_centerline(center01, start_xy, goal_xy, cong_mask=None,
+                        allow_diag=False,
+                        congestion_w=12.0, entry_penalty=30.0, inside_penalty=2.5):
+    """
+    center01: 0/1 중앙선(또는 스켈) 마스크
     start_xy, goal_xy: (x, y)
-    cost_map: 동일 크기의 float 맵 (기본=1.0, 체증/벽근접 > 1.0)
-    entry_penalty / inside_penalty / cross_penalty: 체증 관련 패널티
-    cong_mask: 체증(팽창 포함) 0/1 맵
-    return: [(y,x), ...] 경로 픽셀 좌표
+    cong_mask: 0/1 체증 마스크
     """
-    H, W = road01.shape
+    H, W = center01.shape
     sx, sy = start_xy
     gx, gy = goal_xy
 
-    # 도로 밖이면 가장 가까운 도로 픽셀로 스냅
-    def snap(x, y):
-        ys, xs = np.where(road01 > 0)
-        if len(xs) == 0:
-            return None
-        i = int(np.argmin((xs - x) ** 2 + (ys - y) ** 2))
+    ys, xs = np.where(center01 > 0)
+    if len(xs) == 0:
+        return []
+    def snap_to_center(x, y):
+        i = int(np.argmin((xs - x)**2 + (ys - y)**2))
         return int(xs[i]), int(ys[i])
 
-    if not (0 <= sx < W and 0 <= sy < H) or road01[sy, sx] == 0:
-        s = snap(sx, sy)
-        if s is None:
-            return []
-        sx, sy = s
+    s = snap_to_center(sx, sy)
+    g = snap_to_center(gx, gy)
+    sx, sy = s
+    gx, gy = g
 
-    if not (0 <= gx < W and 0 <= gy < H) or road01[gy, gx] == 0:
-        g = snap(gx, gy)
-        if g is None:
-            return []
-        gx, gy = g
+    NEI = NEI8 if allow_diag else NEI4
 
-    def heur(x, y):  # admissible 유지(맨해튼)
-        return abs(x - gx) + abs(y - gy)
+    def heur(x, y):
+        return abs(x - gx) + abs(y - gy) if not allow_diag else ((x - gx)**2 + (y - gy)**2)**0.5
 
     openh = []
     heappush(openh, (heur(sx, sy), 0.0, (sx, sy)))
     came = {}
     gscore = {(sx, sy): 0.0}
+    visited = set()
 
     while openh:
         f, gcost, (x, y) = heappop(openh)
+        if (x, y) in visited:
+            continue
+        visited.add((x, y))
         if (x, y) == (gx, gy):
             break
 
-        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1), (-1,-1),(-1,1),(1,-1),(1,1)]:
+        for dx, dy in NEI:
             nx, ny = x + dx, y + dy
             if not (0 <= nx < W and 0 <= ny < H):
                 continue
-            if not road01[ny, nx]:
+            if center01[ny, nx] == 0:
                 continue
 
-            # --- 코너-컷팅 금지: 대각 이동이면 양옆 직교칸도 열려 있어야 함 ---
-            if dx and dy:
-                if not (road01[y, nx] and road01[ny, x]):
-                    continue
-            # -----------------------------------------------------------------
-
-            step = 1.41421356 if dx and dy else 1.0
-
-            # 이동 비용 = 평균 cost * step + 패널티
-            if cost_map is None:
-                w = 1.0
-            else:
-                w = 0.5 * (float(cost_map[y, x]) + float(cost_map[ny, nx]))
+            step = 1.0 if (dx == 0 or dy == 0) else 1.41421356
 
             add = 0.0
             if cong_mask is not None:
-                a = cong_mask[y, x]  > 0
+                a = cong_mask[y, x] > 0
                 b = cong_mask[ny, nx] > 0
                 if (not a) and b:
-                    add += entry_penalty + cross_penalty
-                if a and b:
-                    add += inside_penalty
-
-            ng = gcost + step * w + add
+                    add += entry_penalty
+                if b:
+                    ng = gcost + step * congestion_w + inside_penalty + add
+                else:
+                    ng = gcost + step + add
+            else:
+                ng = gcost + step
 
             if ng < gscore.get((nx, ny), float("inf")):
                 gscore[(nx, ny)] = ng
                 came[(nx, ny)] = (x, y)
                 heappush(openh, (ng + heur(nx, ny), ng, (nx, ny)))
 
-    # 경로 복원
     if (gx, gy) not in came and (gx, gy) != (sx, sy):
         return []
-    path = [(sy, sx)]
+    
+    path = []
     cur = (gx, gy)
-    while cur != (sx, sy):
-        path.append((cur[1], cur[0]))  # (y,x)
-        prev = came.get(cur)
-        if prev is None:
+    while cur is not None:
+        path.append((cur[1], cur[0]))
+        if cur == (sx, sy):
             break
-        cur = prev
+        cur = came.get(cur)
     path.reverse()
     return path
 
-# ------------------------------------------------
-# 3) 마우스로 S/D/체증 찍기
-# ------------------------------------------------
+# =========================
+# 마우스 UI (S/D + 체증 사각형)
+# =========================
 class Picker:
     def __init__(self, img):
         self.img0 = img.copy()
         self.img = img.copy()
         self.S = None
         self.D = None
-
-        self.window_name = "Pathfinder" # 고정 창 이름
-        self.drawing_block_mode = False  # 'R' 키로 토글
-        self.block_p1 = None             # 체증 영역 첫 클릭 지점
-        self.blocks = []                 # (x1, y1, x2, y2) 리스트
+        self.window_name = "Centerline / Skeleton Pathfinder"
+        self.drawing_block_mode = False
+        self.block_p1 = None
+        self.blocks = []   # (x1,y1,x2,y2)
 
     def on_mouse(self, e, x, y, flags, param):
         if self.drawing_block_mode:
-            # 체증(장애물) 설정 모드
             if e == cv2.EVENT_LBUTTONDOWN:
                 if self.block_p1 is None:
                     self.block_p1 = (x, y)
@@ -367,7 +245,6 @@ class Picker:
                     self.block_p1 = None
                 self.redraw()
         else:
-            # S/D 설정 모드
             if e == cv2.EVENT_LBUTTONDOWN:
                 if self.S is None:
                     self.S = (x, y)
@@ -387,144 +264,63 @@ class Picker:
 
     def redraw(self):
         self.img = self.img0.copy()
-
-        # S/D 그리기
         if self.S is not None:
-            cv2.circle(self.img, self.S, 6, DRAW_START_BLUE, -1)
+            cv2.circle(self.img, self.S, 6, (255, 0, 0), -1)
         if self.D is not None:
-            cv2.circle(self.img, self.D, 6, DRAW_GOAL_GREEN, -1)
-
-        # 체증 사각형
+            cv2.circle(self.img, self.D, 6, (0, 255, 0), -1)
         for (x1, y1, x2, y2) in self.blocks:
-            cv2.rectangle(self.img, (x1, y1), (x2, y2), DRAW_ROUTE_RED, 2)
-
-        # 체증 첫 점
+            cv2.rectangle(self.img, (x1, y1), (x2, y2), (0, 0, 255), 2)
         if self.block_p1 is not None:
-            cv2.circle(self.img, self.block_p1, 5, DRAW_ROUTE_RED, -1)
+            cv2.circle(self.img, self.block_p1, 5, (0, 0, 255), -1)
 
-        # 모드 텍스트
-        if self.drawing_block_mode:
-            mode_text = "Mode: BLOCK (R: Switch, C: Clear)"
-            color = (0, 255, 255)
-        else:
-            mode_text = "Mode: S/D (R: Switch)"
-            color = (255, 255, 0)
-
-        cv2.putText(self.img, mode_text, (10, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
+        txt = "Mode: BLOCK (R: Switch, C: Clear)" if self.drawing_block_mode else "Mode: S/D (R: Switch)"
+        color = (0, 255, 255) if self.drawing_block_mode else (255, 255, 0)
+        cv2.putText(self.img, txt, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         cv2.imshow(self.window_name, self.img)
 
-# ------------------------------------------------
-# 4) 메인 solve (체증 + 벽타기 억제)
-# ------------------------------------------------
-def solve(image_bgr, S_xy, D_xy, blocks=[], show_no_path_marker=True):
-    # (A) 흰색=도로
-    road = road_mask_white(image_bgr).astype(np.uint8)  # 0/1
-    H, W = road.shape
+# ==== robust draw: 센터(또는 스켈) 위 픽셀만 최종 출력 ====
+def draw_path_on_canvas(canvas, center01, path, color=(0, 0, 255), thick=3, tol=1):
+    """
+    canvas: BGR 이미지
+    center01: 0/1 중앙선(또는 스켈) 마스크
+    path: [(y,x), ...]
+    tol: 센터 라인 허용 오차(px). 1~2 주면 약간 퍼진 선도 허용됨.
+    """
+    if len(path) < 2:
+        return
 
-    # (A.1) 벽타기 억제 (a): 도로 침식으로 벽에서 여유 간격 확보
-    if ERODE_ITERS > 0:
-        road = cv2.erode(road, np.ones((3, 3), np.uint8), iterations=ERODE_ITERS)
+    h, w = center01.shape
+    # 1) 경로를 빈 마스크에 그림 (안티알리아싱 금지: LINE_8)
+    path_mask = np.zeros((h, w), np.uint8)
+    for (y1, x1), (y2, x2) in zip(path[:-1], path[1:]):
+        cv2.line(path_mask, (x1, y1), (x2, y2), 255, thickness=thick, lineType=cv2.LINE_8)
 
-    # (A.2) 체증 마스크(원본) + 팽창
-    cong_mask = np.zeros((H, W), dtype=np.uint8)
-    for (x1, y1, x2, y2) in blocks:
-        cong_mask[y1:y2, x1:x2] = 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*DILATE_RADIUS+1, 2*DILATE_RADIUS+1))
-    cong_mask_dil = cv2.dilate(cong_mask, kernel, iterations=1)
+    # 2) 센터를 약간 팽창해 허용오차 반영
+    if tol > 0:
+        k = 2 * tol + 1
+        center_thick = cv2.dilate(center01, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), 1)
+    else:
+        center_thick = center01
 
-    # (A.3) 비용맵 기본 1.0
-    cost_map = np.ones((H, W), dtype=np.float32)
-    # 체증 내부 가중치
-    cost_map[cong_mask_dil > 0] *= CONGESTION_W
+    # 3) 센터 위 픽셀만 남김
+    masked = cv2.bitwise_and(path_mask, (center_thick * 255).astype(np.uint8))
 
-    # (A.4) 벽타기 억제 (b): 벽 근접 패널티 (distance transform)
-    # road==1 내부 거리맵: 값이 클수록 벽에서 멀리 있음
-    dist = cv2.distanceTransform((road*255).astype(np.uint8), cv2.DIST_L2, 3)
-    # 0에 가까울수록 벽에 붙음 → exp(-dist/decay)로 패널티 형성
-    wall_penalty = np.exp(-dist / max(1e-6, WALL_PENALTY_DECAY))
-    cost_map += wall_penalty * WALL_PENALTY_GAIN
+    # 4) 최종 합성
+    ys, xs = np.where(masked > 0)
+    canvas[ys, xs] = color
 
-    # (B) 스켈레톤 경로 (가중 비용)
-    skel = skeletonize01(road)
-    nodes, node_idmap = extract_nodes_and_map(skel)
-    edges = trace_edges(
-        skel, nodes, node_idmap,
-        cost_map=cost_map,
-        entry_penalty=ENTRY_PENALTY,
-        cong_mask=cong_mask_dil,
-        inside_penalty=INSIDE_PENALTY,
-        cross_penalty=CROSS_PENALTY
-    )
-    G = build_graph(nodes, edges)
-
-    vis = image_bgr.copy()
-    # 스켈 회색 표시
-    ys, xs = np.where(skel > 0)
-    vis[ys, xs] = DRAW_SKELETON_GRAY
-
-    # 체증 영역 반투명 표시(원 사각형 기준)
-    for (x1, y1, x2, y2) in blocks:
-        sub = vis[y1:y2, x1:x2]
-        red_rect = np.zeros_like(sub)
-        red_rect[:,:] = DRAW_ROUTE_RED
-        res = cv2.addWeighted(sub, 0.7, red_rect, 0.3, 0.0)
-        vis[y1:y2, x1:x2] = res
-        cv2.rectangle(vis, (x1, y1), (x2, y2), DRAW_ROUTE_RED, 1)
-
-    red_path_drawn = False
-
-    if len(G) > 0 and len(nodes) >= 2:
-        S_px = nearest_skel_pixel(S_xy, skel)
-        D_px = nearest_skel_pixel(D_xy, skel)
-        if S_px and D_px:
-            s_idx = bfs_to_node(S_px, skel, node_idmap)
-            d_idx = bfs_to_node(D_px, skel, node_idmap)
-            if s_idx is not None and d_idx is not None:
-                try:
-                    _, node_path = nx.bidirectional_dijkstra(G, s_idx, d_idx, weight='weight')
-                    route = stitch_polylines(node_path, G)
-                    if len(route) >= 2:
-                        for (y1, x1), (y2, x2) in zip(route[:-1], route[1:]):
-                            cv2.line(vis, (x1, y1), (x2, y2), DRAW_ROUTE_RED, 3)
-                        red_path_drawn = True
-                except Exception:
-                    pass
-
-    # (C) 스켈 실패 → A* 폴백 (가중 비용 + 코너-컷팅 금지)
-    if not red_path_drawn:
-        grid_path = astar_grid(
-            road, S_xy, D_xy,
-            cost_map=cost_map,
-            entry_penalty=ENTRY_PENALTY,
-            cong_mask=cong_mask_dil,
-            inside_penalty=INSIDE_PENALTY,
-            cross_penalty=CROSS_PENALTY
-        )
-        if len(grid_path) >= 2:
-            for (y1, x1), (y2, x2) in zip(grid_path[:-1], grid_path[1:]):
-                cv2.line(vis, (x1, y1), (x2, y2), DRAW_ROUTE_RED, 3)
-            red_path_drawn = True
-
-    # (D) 실패 메시지
-    if not red_path_drawn:
-        cv2.putText(vis, "No detour exists", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, DRAW_ROUTE_RED, 2, cv2.LINE_AA)
-
-    # S/D 마커
-    cv2.circle(vis, S_xy, 6, DRAW_START_BLUE, -1)
-    cv2.circle(vis, D_xy, 6, DRAW_GOAL_GREEN, -1)
-    return vis, (skel * 255).astype(np.uint8), (road * 255).astype(np.uint8)
-
-# ------------------------------------------------
-# 5) 실행
-# ------------------------------------------------
+# =========================
+# 메인
+# =========================
 if __name__ == "__main__":
     img = cv2.imread(img_path)
     if img is None:
         raise FileNotFoundError(f"이미지 파일을 찾을 수 없습니다: {img_path}")
 
+    # 마스크 생성(흰 중앙선 우선, 없으면 스켈레톤)
+    road_gray, center, center_white, center_fallback, used_white = make_road_and_center(img)
+
+    # 선택 UI
     picker = Picker(img)
     cv2.namedWindow(picker.window_name)
     cv2.setMouseCallback(picker.window_name, picker.on_mouse)
@@ -535,21 +331,87 @@ if __name__ == "__main__":
         if k in (13, 10):  # Enter
             if picker.S and picker.D:
                 break
-        elif k == 27:  # Esc
+        elif k == 27:
             cv2.destroyAllWindows()
             raise SystemExit
-        elif k == ord('r'):  # 모드 전환
+        elif k == ord('r'):
             picker.set_mode(not picker.drawing_block_mode)
-        elif k == ord('c'):  # 체증 초기화
+        elif k == ord('c'):
             picker.clear_blocks()
 
     S, D = picker.S, picker.D
     blocks = picker.blocks
     cv2.destroyWindow(picker.window_name)
 
-    vis, skel_img, road_mask = solve(img, S, D, blocks)
-    cv2.imshow("road_mask (eroded)", road_mask)
-    cv2.imshow("skeleton", skel_img)
-    cv2.imshow("result", vis)
+    # 체증 마스크
+    H, W = center.shape
+    cong_mask = np.zeros((H, W), np.uint8)
+    for (x1, y1, x2, y2) in blocks:
+        cong_mask[y1:y2, x1:x2] = 1
+    if DILATE_CONGEST > 0:
+        k = 2 * DILATE_CONGEST + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+        cong_mask = cv2.dilate(cong_mask, kernel, 1)
+
+    # 중앙선/스켈레톤 위에서만 경로 탐색 (직선 없음)
+    path = astar_on_centerline(
+        center, S, D,
+        cong_mask=cong_mask,
+        allow_diag=ALLOW_DIAGONAL,
+        congestion_w=CONGESTION_W,
+        entry_penalty=ENTRY_PENALTY,
+        inside_penalty=INSIDE_PENALTY
+    )
+
+    # ===== 시각화 =====
+    # (a) result_dual: 회색 도로 + 중앙선(흰) or 스켈(흰)
+    vis_dual = img.copy()
+    yg, xg = np.where(road_gray > 0)
+    vis_dual[yg, xg] = (200, 200, 200)  # 회색 도로
+    yc, xc = np.where(center > 0)
+    vis_dual[yc, xc] = (255, 255, 255)  # 중앙선/스켈
+
+    # 체증 사각형 반투명 오버레이
+    for (x1, y1, x2, y2) in blocks:
+        sub = vis_dual[y1:y2, x1:x2]
+        if sub.size:
+            overlay = sub.copy()
+            overlay[:] = (0, 0, 255)
+            vis_dual[y1:y2, x1:x2] = cv2.addWeighted(sub, 0.7, overlay, 0.3, 0)
+
+    # (b) result_allwhite: 도로 전체를 흰색(미적)
+    vis_allwhite = vis_dual.copy()
+    vis_allwhite[yg, xg] = (255, 255, 255)
+
+    # 경로 그리기 (중앙선/스켈 경로만) — 직선 없음
+    # --- (여기서부터 기존 '경로 그리기' 구간 교체) ---
+    DRAW_THICK = 3
+    TOL = 0  # 센터 선에서 ±1px 허용
+
+    if len(path) >= 2:
+        # 두 캔버스 모두 동일하게 “센터 위” 픽셀만 그리기
+        draw_path_on_canvas(vis_dual, center, path, color=(0, 0, 255), thick=DRAW_THICK, tol=TOL)
+        draw_path_on_canvas(vis_allwhite, center, path, color=(0, 0, 255), thick=DRAW_THICK, tol=TOL)
+    else:
+        cv2.putText(vis_dual, "No path on center/skeleton", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(vis_allwhite, "No path on center/skeleton", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+
+    # S/D 마커
+    for canvas in (vis_dual, vis_allwhite):
+        cv2.circle(canvas, S, 6, (255, 0, 0), -1)
+        cv2.circle(canvas, D, 6, (0, 255, 0), -1)
+
+    # 디버그(필요시 주석 해제해서 확인)
+    # cv2.imshow("DEBUG_center_white", center_white*255)
+    # cv2.imshow("DEBUG_center_fallback", center_fallback*255)
+    # cv2.imshow("DEBUG_center_used", center*255)
+
+    # 결과 표시
+    title_dual = "result_dual (gray road + {} + congestion)".format("white center" if used_white else "road skeleton")
+    cv2.imshow(title_dual, vis_dual)
+    cv2.imshow("result_allwhite (road painted white, same path)", vis_allwhite)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
