@@ -20,9 +20,9 @@ img_path = "main.png"
 # -------------------------
 # 밝기/마스크 파라미터
 # -------------------------
-T_GRAY = 128              # 회색 도로: gray >= T_GRAY
+T_GRAY = 20              # 회색 도로: gray >= T_GRAY
 STRICT_WHITE = 245        # 중앙선(엄격): RGB 모두 >= 245
-CENTERLINE_DILATE = 1     # 중앙선 단절 보정 (0~1 권장)
+CENTERLINE_DILATE = 0     # 중앙선 단절 보정 (0~1 권장)
 
 # 스켈레톤 생성 시 도로 전처리(침식/열림) 정도
 ROAD_ERODE_ITERS = 0
@@ -364,54 +364,47 @@ if __name__ == "__main__":
     )
 
     # ===== 시각화 =====
-    # (a) result_dual: 회색 도로 + 중앙선(흰) or 스켈(흰)
-    vis_dual = img.copy()
-    yg, xg = np.where(road_gray > 0)
-    vis_dual[yg, xg] = (200, 200, 200)  # 회색 도로
-    yc, xc = np.where(center > 0)
-    vis_dual[yc, xc] = (255, 255, 255)  # 중앙선/스켈
+# ===== 시각화 =====
+# (a) result_dual: 회색 도로 + 중앙선(흰) or 스켈(흰)
+vis_dual = img.copy()
+yg, xg = np.where(road_gray > 0)
+vis_dual[yg, xg] = (200, 200, 200)  # 회색 도로
+yc, xc = np.where(center > 0)
+vis_dual[yc, xc] = (255, 255, 255)  # 중앙선/스켈
 
-    # 체증 사각형 반투명 오버레이
-    for (x1, y1, x2, y2) in blocks:
-        sub = vis_dual[y1:y2, x1:x2]
-        if sub.size:
-            overlay = sub.copy()
-            overlay[:] = (0, 0, 255)
-            vis_dual[y1:y2, x1:x2] = cv2.addWeighted(sub, 0.7, overlay, 0.3, 0)
+# 체증 사각형 반투명 오버레이 (dual에만)
+for (x1, y1, x2, y2) in blocks:
+    sub = vis_dual[y1:y2, x1:x2]
+    if sub.size:
+        overlay = sub.copy()
+        overlay[:] = (0, 0, 255)
+        vis_dual[y1:y2, x1:x2] = cv2.addWeighted(sub, 0.7, overlay, 0.3, 0)
 
-    # (b) result_allwhite: 도로 전체를 흰색(미적)
-    vis_allwhite = vis_dual.copy()
-    vis_allwhite[yg, xg] = (255, 255, 255)
+# (b) result_allwhite: '원본 img'에서 새로 만들고, 도로만 순백으로 칠함
+vis_allwhite = img.copy()                 # ← 핵심: dual에서 복사하지 않음
+vis_allwhite[yg, xg] = (255, 255, 255)    # 도로 전체를 흰색으로
 
-    # 경로 그리기 (중앙선/스켈 경로만) — 직선 없음
-    # --- (여기서부터 기존 '경로 그리기' 구간 교체) ---
-    DRAW_THICK = 3
-    TOL = 0  # 센터 선에서 ±1px 허용
+# 경로 그리기 (중앙선/스켈 경로만) — 직선 없음
+DRAW_THICK = 3
+TOL = 0  # 센터에서 ±0px만 허용
 
-    if len(path) >= 2:
-        # 두 캔버스 모두 동일하게 “센터 위” 픽셀만 그리기
-        draw_path_on_canvas(vis_dual, center, path, color=(0, 0, 255), thick=DRAW_THICK, tol=TOL)
-        draw_path_on_canvas(vis_allwhite, center, path, color=(0, 0, 255), thick=DRAW_THICK, tol=TOL)
-    else:
-        cv2.putText(vis_dual, "No path on center/skeleton", (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.putText(vis_allwhite, "No path on center/skeleton", (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+if len(path) >= 2:
+    draw_path_on_canvas(vis_dual, center, path, color=(0, 0, 255), thick=DRAW_THICK, tol=TOL)
+    draw_path_on_canvas(vis_allwhite, center, path, color=(0, 0, 255), thick=DRAW_THICK, tol=TOL)
+else:
+    cv2.putText(vis_dual, "No path on center/skeleton", (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    cv2.putText(vis_allwhite, "No path on center/skeleton", (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
+# S/D 마커 (클린하게 마지막에)
+for canvas in (vis_dual, vis_allwhite):
+    cv2.circle(canvas, S, 6, (255, 0, 0), -1)
+    cv2.circle(canvas, D, 6, (0, 255, 0), -1)
 
-    # S/D 마커
-    for canvas in (vis_dual, vis_allwhite):
-        cv2.circle(canvas, S, 6, (255, 0, 0), -1)
-        cv2.circle(canvas, D, 6, (0, 255, 0), -1)
-
-    # 디버그(필요시 주석 해제해서 확인)
-    # cv2.imshow("DEBUG_center_white", center_white*255)
-    # cv2.imshow("DEBUG_center_fallback", center_fallback*255)
-    # cv2.imshow("DEBUG_center_used", center*255)
-
-    # 결과 표시
-    title_dual = "result_dual (gray road + {} + congestion)".format("white center" if used_white else "road skeleton")
-    cv2.imshow(title_dual, vis_dual)
-    cv2.imshow("result_allwhite (road painted white, same path)", vis_allwhite)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+# 결과 표시
+title_dual = "result_dual (gray road + {} + congestion)".format("white center" if used_white else "road skeleton")
+cv2.imshow(title_dual, vis_dual)
+cv2.imshow("result_allwhite (road painted white, same path)", vis_allwhite)
+cv2.waitKey(0)
+cv2.destroyAllWindows()
